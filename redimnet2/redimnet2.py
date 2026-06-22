@@ -8,7 +8,12 @@ import redimnet2.layers.features as features
 import redimnet2.layers.features_tf as features_tf
 import redimnet2.layers.poolings as pooling_layers
 from redimnet2.layers.layernorm import LayerNorm
-from redimnet2.layers.blocks import ConvBlock2d, TimeContextBlock1d
+from redimnet2.layers.blocks import (
+    ConvBlock2d,
+    TimeContextBlock1d,
+    SymmetricalDWMixer,
+    TimeContextBlock1dV2,
+)
 from redimnet2.layers.redim_structural import to1d, to2d, to1d_tfopt, to2d_tfopt, weigth1d
 
 # class ShapeLogger(nn.Module):
@@ -58,7 +63,29 @@ def _ntuple(n, name="parse"):
     return parse
     
 _pair = _ntuple(2, "_pair")
-        
+
+
+def _parse_agg_gnorm(spec, C, F):
+    if spec is False or spec is None:
+        return 0
+    if spec is True:
+        groups = int(C)
+    elif isinstance(spec, int):
+        if spec <= 0:
+            return 0
+        groups = int(spec)
+    else:
+        raise TypeError(f"agg_gnorm must be bool, int, or None; got {spec!r}")
+
+    num_channels = int(C * F)
+    if num_channels % groups != 0:
+        raise ValueError(f"agg_gnorm groups={groups} must divide C*F={num_channels}")
+    return groups
+
+
+def _make_agg_norm(groups, num_channels):
+    return nn.GroupNorm(num_groups=groups, num_channels=num_channels)
+
 #------------------------------------------
 #                 UReDimNet
 #------------------------------------------
@@ -90,6 +117,7 @@ class ReDimNet2(nn.Module):
         group_divisor = 1,
         dual_agg = False,
         agg_gnorm = False,
+        att_dos = None,
         #-----------------------
         #     Subnet stuff
         #-----------------------
@@ -113,13 +141,22 @@ class ReDimNet2(nn.Module):
         else:
             raise NotImplementedError()
 
+        self.tcm_v2 = block_1d_type.startswith('v2_')
+        if self.tcm_v2:
+            block_1d_type = block_1d_type[len('v2_'):]
+
+        self.use_sdwm = block_1d_type.startswith('sdwm_')
+        if self.use_sdwm:
+            block_1d_type = block_1d_type[len('sdwm_'):]
+
         self.block_1d_type = block_1d_type
         self.block_2d_type = block_2d_type
 
         self.stages_setup = stages_setup
         self.fm_weigthing_type = fm_weigthing_type
         self.dual_agg = dual_agg
-        self.agg_gnorm = agg_gnorm
+        self.agg_gnorm = _parse_agg_gnorm(agg_gnorm, C, F)
+        self.att_dos = {} if att_dos is None else att_dos
 
         # Subnet stuff
         self.is_subnet = is_subnet
@@ -144,8 +181,34 @@ class ReDimNet2(nn.Module):
         
         self.num_stages = len(stages_setup)
 
-        append_to1d_before_tcm = True
-        Block1d = functools.partial(TimeContextBlock1d,block_type=self.block_1d_type)
+        append_to1d_before_tcm = not self.use_sdwm
+        if self.use_sdwm:
+            _sdwm_partial = functools.partial(
+                SymmetricalDWMixer,
+                block_type=self.block_1d_type,
+                **self.att_dos,
+            )
+
+            def Block1d(*args, C=None, F=None, hC=None, _stt_val=1, **kw):
+                return _sdwm_partial(C=C, F=F, hC=hC)
+        elif self.tcm_v2:
+            _v2_partial = functools.partial(
+                TimeContextBlock1dV2,
+                block_type=self.block_1d_type,
+                **self.att_dos,
+            )
+
+            def Block1d(*args, _stt_val=1, **kw):
+                return _v2_partial(*args, time_stride=_stt_val, **kw)
+        else:
+            _v1_partial = functools.partial(
+                TimeContextBlock1d,
+                block_type=self.block_1d_type,
+                **self.att_dos,
+            )
+
+            def Block1d(*args, _stt_val=1, **kw):
+                return _v1_partial(*args, **kw)
         Block2d = functools.partial(ConvBlock2d,block_type=self.block_2d_type)
 
         if self.fm_weigthing_type == 'NC':
@@ -176,7 +239,7 @@ class ReDimNet2(nn.Module):
             )
 
         if self.agg_gnorm:
-            self.stem_gnorm = nn.GroupNorm(num_groups=C, num_channels=C*F)
+            self.stem_gnorm = _make_agg_norm(self.agg_gnorm, C*F)
 
         # Track accumulated feature-map count for the weigth1d N parameter.
         # Starts at offset_fm_weights+1 to account for the subnet offset + stem output.
@@ -230,17 +293,26 @@ class ReDimNet2(nn.Module):
                     layers.append(to1d())
                 setattr(self, f'stage{stage_ind}_pre', nn.Sequential(*layers))
 
-                blk_1d = Block1d(C*F, hC=(C*F)//att_block_red)
+                if append_to1d_before_tcm:
+                    blk_1d = Block1d(C*F, hC=(C*F)//att_block_red, _stt_val=stt)
+                else:
+                    blk_1d = Block1d(C=c, F=f, hC=att_block_red, _stt_val=stt)
                 setattr(self, f'stage{stage_ind}_1d', blk_1d)
 
-                up_2d = [ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest'))]
+                up_2d = []
+                if not append_to1d_before_tcm:
+                    up_2d.append(to1d())
+                up_2d.append(ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest')))
                 if self.agg_gnorm:
-                    up_2d.append(nn.GroupNorm(num_groups=C, num_channels=C*F))
+                    up_2d.append(_make_agg_norm(self.agg_gnorm, C*F))
                 setattr(self, f'stage{stage_ind}_up_2d', nn.Sequential(*up_2d))
 
-                up_1d = [ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest'))]
+                up_1d = []
+                if not append_to1d_before_tcm:
+                    up_1d.append(to1d())
+                up_1d.append(ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest')))
                 if self.agg_gnorm:
-                    up_1d.append(nn.GroupNorm(num_groups=C, num_channels=C*F))
+                    up_1d.append(_make_agg_norm(self.agg_gnorm, C*F))
                 setattr(self, f'stage{stage_ind}_up_1d', nn.Sequential(*up_1d))
 
                 self._stage_has_dual.append(True)
@@ -250,14 +322,14 @@ class ReDimNet2(nn.Module):
                     layers.append(to1d())
                 if att_block_red is not None:
                     if append_to1d_before_tcm:
-                        layers.append(Block1d(C*F,hC=(C*F)//att_block_red))
+                        layers.append(Block1d(C*F,hC=(C*F)//att_block_red, _stt_val=stt))
                     else:
-                        layers.append(Block1d(C=c,F=f,hC=att_block_red))
+                        layers.append(Block1d(C=c,F=f,hC=att_block_red, _stt_val=stt))
                 if not append_to1d_before_tcm:
                     layers.append(to1d())
                 layers.append(ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest')))
                 if self.agg_gnorm:
-                    layers.append(nn.GroupNorm(num_groups=C, num_channels=C*F))
+                    layers.append(_make_agg_norm(self.agg_gnorm, C*F))
                 setattr(self,f'stage{stage_ind}',nn.Sequential(*layers))
 
                 self._stage_has_dual.append(False)
@@ -348,6 +420,7 @@ class ReDimNet2Wrap(nn.Module):
         group_divisor = 1,
         dual_agg = False,
         agg_gnorm = False,
+        att_dos = None,
         #-------------------------
         embed_dim=192,
         num_classes=None,
@@ -388,6 +461,7 @@ class ReDimNet2Wrap(nn.Module):
             group_divisor = group_divisor,
             dual_agg = dual_agg,
             agg_gnorm = agg_gnorm,
+            att_dos = att_dos,
             return_all_outputs = return_all_outputs,
         )
         if feat_type in ['pt','pt_mel']:

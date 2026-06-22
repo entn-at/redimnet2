@@ -10,6 +10,46 @@ from collections import OrderedDict
 from typing import Iterable, Optional
 
 #-------------------------------------------------------------
+# Rotary positional embeddings
+#-------------------------------------------------------------
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return x * cos + _rotate_half(x) * sin
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, base: float = 10000.0, max_seq_len: int = 4096):
+        super().__init__()
+        assert head_dim % 2 == 0, f"RoPE requires even head_dim, got {head_dim}"
+        self.head_dim = head_dim
+        self.base = base
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._build_cache(max_seq_len)
+
+    def _build_cache(self, seq_len: int):
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("_cos_cache", emb.cos(), persistent=False)
+        self.register_buffer("_sin_cache", emb.sin(), persistent=False)
+        self._cached_len = seq_len
+
+    def forward(self, seq_len: int, device, dtype):
+        if seq_len > self._cached_len:
+            self._build_cache(seq_len)
+        cos = self._cos_cache[:seq_len].to(device=device, dtype=dtype)
+        sin = self._sin_cache[:seq_len].to(device=device, dtype=dtype)
+        return cos, sin
+
+
+#-------------------------------------------------------------
 # Copy multi-head attention module from hugginface wav2vec2
 #-------------------------------------------------------------
 
@@ -24,12 +64,18 @@ class MultiHeadAttention(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         bias: bool = True,
+        qk_norm: bool = False,
+        qk_rope: bool = False,
+        rope_base: float = 10000.0,
+        rope_max_seq_len: int = 4096,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout = dropout
         self.head_dim = embed_dim // num_heads
+        self.qk_norm = qk_norm
+        self.qk_rope = qk_rope
 
         if (self.head_dim * num_heads) != self.embed_dim:
             raise ValueError(
@@ -43,6 +89,13 @@ class MultiHeadAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
+        if self.qk_rope:
+            self.rope = RotaryEmbedding(
+                head_dim=self.head_dim,
+                base=rope_base,
+                max_seq_len=rope_max_seq_len,
+            )
+
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
@@ -51,7 +104,7 @@ class MultiHeadAttention(nn.Module):
         bsz, tgt_len, _ = hidden_states.size()
 
         # get query proj
-        query_states = self.q_proj(hidden_states) * self.scaling
+        query_states = self.q_proj(hidden_states)
         # self_attention
         key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
         value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
@@ -61,8 +114,17 @@ class MultiHeadAttention(nn.Module):
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
 
+        if self.qk_rope:
+            cos, sin = self.rope(tgt_len, device=query_states.device, dtype=query_states.dtype)
+            query_states = _apply_rope(query_states, cos, sin)
+            key_states = _apply_rope(key_states, cos, sin)
+
+        if self.qk_norm:
+            query_states = F.normalize(query_states, dim=-1)
+            key_states = F.normalize(key_states, dim=-1)
+
         src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2)) * self.scaling
         attn_weights = F.softmax(attn_weights, dim=-1)
 
         attn_probs = F.dropout(attn_weights, p=self.dropout, training=self.training)
@@ -249,6 +311,103 @@ class TransformerEncoderLayer(nn.Module):
         hidden_states = attn_residual + hidden_states
 
         hidden_states = self.layer_norm(hidden_states)
+        hidden_states = hidden_states + self.feed_forward(hidden_states)
+        hidden_states = self.final_layer_norm(hidden_states)
+
+        outputs = hidden_states
+        if not self.channel_last:
+            outputs = outputs.permute(0, 2, 1)
+        return outputs
+
+
+class StableTransformerEncoderLayer(nn.Module):
+    def __init__(self,
+            n_state: int,
+            n_mlp : int,
+            n_head: int,
+            channel_last: bool = False,
+            act: str = 'gelu_new',
+            act_do:float = 0.0,
+            att_do:float = 0.02,
+            hid_do:float = 0.0,
+            ln_eps:float=1e-6
+        ):
+        super().__init__()
+        self.channel_last = channel_last
+        self.attention = MultiHeadAttention(
+            embed_dim=n_state,
+            num_heads=n_head,
+            dropout=att_do,
+            qk_norm=True,
+        )
+        self.layer_norm = nn.LayerNorm(n_state, eps=ln_eps)
+        self.feed_forward = FeedForward(
+            hidden_size=n_state,
+            hidden_act=act,
+            intermediate_size=n_mlp,
+            activation_dropout=act_do,
+            hidden_dropout=hid_do,
+        )
+        self.final_layer_norm = nn.LayerNorm(n_state, eps=ln_eps)
+
+    def forward(self, hidden_states):
+        if not self.channel_last:
+            hidden_states = hidden_states.permute(0, 2, 1)
+
+        hidden_states = hidden_states + self.attention(self.layer_norm(hidden_states))
+        hidden_states = hidden_states + self.feed_forward(self.final_layer_norm(hidden_states))
+
+        outputs = hidden_states
+        if not self.channel_last:
+            outputs = outputs.permute(0, 2, 1)
+        return outputs
+
+
+class TransformerEncoderLayerV2(nn.Module):
+    def __init__(self,
+            n_state: int,
+            n_mlp: int,
+            n_head: int,
+            channel_last: bool = False,
+            act: str = 'gelu_new',
+            act_do: float = 0.0,
+            att_do: float = 0.0,
+            hid_do: float = 0.0,
+            ln_eps: float = 1e-6,
+            qk_norm: bool = False,
+            rope_max_seq_len: int = 4096,
+            rope_base: float = 10000.0,
+        ):
+        super().__init__()
+        self.channel_last = channel_last
+        self.attention = MultiHeadAttention(
+            embed_dim=n_state,
+            num_heads=n_head,
+            dropout=att_do,
+            qk_norm=qk_norm,
+            qk_rope=True,
+            rope_base=rope_base,
+            rope_max_seq_len=rope_max_seq_len,
+        )
+        self.layer_norm = nn.LayerNorm(n_state, eps=ln_eps)
+        self.feed_forward = FeedForward(
+            hidden_size=n_state,
+            hidden_act=act,
+            intermediate_size=n_mlp,
+            activation_dropout=act_do,
+            hidden_dropout=hid_do,
+        )
+        self.final_layer_norm = nn.LayerNorm(n_state, eps=ln_eps)
+
+    def forward(self, hidden_states):
+        if not self.channel_last:
+            hidden_states = hidden_states.permute(0, 2, 1)
+
+        attn_residual = hidden_states
+        hidden_states = self.attention(hidden_states)
+        hidden_states = attn_residual + hidden_states
+        hidden_states = self.layer_norm(hidden_states)
+
         hidden_states = hidden_states + self.feed_forward(hidden_states)
         hidden_states = self.final_layer_norm(hidden_states)
 
