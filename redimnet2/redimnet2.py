@@ -97,7 +97,7 @@ class ReDimNet2(nn.Module):
         spec_in_channels = 1, # Phase + Magnitude
         causal = 'none',
         out_channels = None,
-        block_1d_type = 'tf-att',
+        block_1d_type = 'conv+att',
         block_2d_type = "basic_resnet",
         return_2d_output = False,
         fm_weigthing_type = 'NC',
@@ -340,7 +340,6 @@ class ReDimNet2(nn.Module):
         self.time_stride = max_stt
         self.freq_stride = sft
         self.head = nn.Identity()
-        print(f"out_channels : {out_channels}")
         if return_2d_output:
             self.fin_to2d = to2d(f=f,c=c)
             if out_channels is not None:
@@ -399,7 +398,6 @@ class ReDimNet2Wrap(nn.Module):
         causal = False,
         spec_in_channels = 1, # Phase + Magnitude
         out_channels = None,
-        # block_1d_type = 'tf-att',
         block_1d_type = 'conv+att',
         block_2d_type = "basic_resnet", 
         compress_tconvs = True,
@@ -436,8 +434,8 @@ class ReDimNet2Wrap(nn.Module):
         #-------------------------
         spec_params = dict(
             do_spec_aug=False,
-            freq_mask_width = (0, 6),
-            time_mask_width = (0, 8),
+            do_preemph=True,
+            norm_signal=True,
         ),
         #-------------------------
         return_all_outputs = False,

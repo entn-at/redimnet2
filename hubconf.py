@@ -1,26 +1,10 @@
 import os
 import sys
-import torch
 
 sys.path.append(os.path.dirname(__file__))
-from redimnet2.redimnet2 import ReDimNet2Wrap
+from redimnet2 import load_custom
 
 dependencies = ['torch', 'torchaudio']
-
-URL_TEMPLATE = "https://github.com/PalabraAI/redimnet2/releases/download/v1.0.0/{model_name}"
-
-
-def load_custom(model_name='b0', train_type='lm', dataset='vox2'):
-    model_name = f'{model_name}-{dataset}-{train_type}.pt'
-    url = URL_TEMPLATE.format(model_name=model_name)
-    full_state_dict = torch.hub.load_state_dict_from_url(url, progress=True)
-
-    model_config = full_state_dict['model_config']
-    state_dict = full_state_dict['state_dict']
-    model = ReDimNet2Wrap(**model_config)
-    load_res = model.load_state_dict(state_dict)
-    assert len(load_res.missing_keys) == 0 and len(load_res.unexpected_keys) == 0
-    return model
 
 
 def redimnet2(model_name='b0', train_type='lm', dataset='vox2', pretrained=True):
@@ -28,8 +12,10 @@ def redimnet2(model_name='b0', train_type='lm', dataset='vox2', pretrained=True)
 
     Args:
         model_name: One of 'b0', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6'.
-        train_type: 'ptn' (pretraining) or 'lm' (large-margin fine-tuning).
-        dataset: Training dataset, default 'vox2'.
+        train_type: 'ptn' (pretraining), 'lm' (large-margin fine-tuning),
+            or 'dis' (distilled; available for b6/vb2+vox2_v0).
+        dataset: Training dataset, default 'vox2'. Other released values
+            include 'vb2+vox2_v0' and 'vb2+vox2+cnc2_v0'.
         pretrained: If True, load pretrained weights.
 
     Returns:

@@ -367,7 +367,7 @@ class TFMelBanks(nn.Module):
         xdtype = x.dtype
         x = x.float()
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast("cuda", enabled=False):
                 x = self.torchfbank(x)+self.eps
                 x = x.log()   
                 x = x - torch.mean(x, dim=-1, keepdim=True)
