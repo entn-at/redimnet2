@@ -1,5 +1,11 @@
 # ReDimNet2: Scaling Speaker Verification via Time-Pooled Dimension Reshaping
 
+[![Papers with Code: VoxCeleb1-O (Clean)](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge.svg?eval=28691&live=1)](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge-link?eval=28691)
+[![Papers with Code: VoxCeleb1-E (Clean)](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge.svg?eval=28692&live=1)](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge-link?eval=28692)
+[![Papers with Code: VoxCeleb1-H (Clean)](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge.svg?eval=28693&live=1)](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge-link?eval=28693)
+[![Papers with Code: CN-Celeb Test (Multi-Enrollment)](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge.svg?eval=28694&live=1)](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge-link?eval=28694)
+[![Papers with Code: SITW Core-Core Eval](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge.svg?eval=28695&live=1)](https://paperswithcode.co/api/v1/papers/2603.11841/leaderboard-badge-link?eval=28695)
+
 This is an official implementation of a neural network architecture presented in the paper: [ReDimNet2: Scaling Speaker Verification via Time-Pooled Dimension Reshaping](https://arxiv.org/abs/2603.11841).
 
 ## Overview
